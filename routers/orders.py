@@ -1,0 +1,153 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
+from typing import List, Optional
+import datetime
+import httpx
+
+from database import get_db
+import models
+import schemas
+
+router = APIRouter(prefix="/api/v1/orders", tags=["Orders"])
+
+PRODUCT_SERVICE_URL = "http://localhost:8001"
+
+
+async def adjust_product_remaining(product_id: int, delta: int):
+    """Product Service에 재고 수량 조정을 요청합니다. delta<0=감소, delta>0=복원."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{PRODUCT_SERVICE_URL}/api/v1/products/{product_id}/remaining",
+                params={"delta": delta},
+                timeout=5.0
+            )
+    except Exception as e:
+        print(f"[WARNING] 재고 수량 조정 실패 (product_id={product_id}, delta={delta}): {e}")
+
+
+def generate_order_number(order_id: int, created_at: datetime.datetime) -> str:
+    date_str = created_at.strftime("%Y%m%d")
+    return f"PK-{date_str}-{order_id:04d}"
+
+
+@router.post("/", response_model=schemas.OrderResponse, status_code=status.HTTP_201_CREATED)
+async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depends(get_db)):
+    new_order = models.Order(
+        order_number="TEMP",
+        buyer_id=order_data.buyer_id,
+        store_id=order_data.store_id,
+        store_name=order_data.store_name,
+        status="pending",
+        payment_method=order_data.payment_method,
+        total_price=order_data.total_price,
+    )
+    db.add(new_order)
+    await db.flush()  # ID를 얻기 위해 flush (commit 전)
+
+    # ID 확보 후 order_number 생성
+    new_order.order_number = generate_order_number(new_order.id, new_order.created_at)
+
+    for item_data in order_data.items:
+        item = models.OrderItem(
+            order_id=new_order.id,
+            product_id=item_data.product_id,
+            product_name=item_data.product_name,
+            quantity=item_data.quantity,
+            unit_price=item_data.unit_price,
+        )
+        db.add(item)
+
+    await db.commit()
+
+    # items 포함해서 재조회
+    result = await db.execute(
+        select(models.Order)
+        .options(selectinload(models.Order.items))
+        .filter(models.Order.id == new_order.id)
+    )
+    created_order = result.scalars().first()
+
+    # 주문 확정 후 Product Service에 재고 감소 요청
+    for item_data in order_data.items:
+        if item_data.product_id:
+            await adjust_product_remaining(item_data.product_id, -item_data.quantity)
+
+    return created_order
+
+
+@router.get("/", response_model=List[schemas.OrderResponse])
+async def list_orders(
+    buyer_id: Optional[int] = None,
+    store_id: Optional[int] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    query = select(models.Order).options(selectinload(models.Order.items))
+    if buyer_id is not None:
+        query = query.filter(models.Order.buyer_id == buyer_id)
+    if store_id is not None:
+        query = query.filter(models.Order.store_id == store_id)
+    if status is not None:
+        query = query.filter(models.Order.status == status)
+    query = query.order_by(models.Order.created_at.desc())
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@router.get("/{order_id}", response_model=schemas.OrderResponse)
+async def get_order(order_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(models.Order)
+        .options(selectinload(models.Order.items))
+        .filter(models.Order.id == order_id)
+    )
+    order = result.scalars().first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order
+
+
+@router.patch("/{order_id}/status", response_model=schemas.OrderResponse)
+async def update_order_status(
+    order_id: int,
+    status_update: schemas.OrderStatusUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(models.Order)
+        .options(selectinload(models.Order.items))
+        .filter(models.Order.id == order_id)
+    )
+    order = result.scalars().first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    order.status = status_update.status
+    await db.commit()
+    await db.refresh(order)
+    return order
+
+
+@router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(models.Order)
+        .options(selectinload(models.Order.items))
+        .filter(models.Order.id == order_id)
+    )
+    order = result.scalars().first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    items_snapshot = list(order.items)  # commit 전에 미리 복사
+    order.status = "cancelled"
+    await db.commit()
+
+    # 취소된 주문의 재고를 Product Service에 복원 요청
+    for item in items_snapshot:
+        if item.product_id:
+            await adjust_product_remaining(item.product_id, item.quantity)
+
+    return None
