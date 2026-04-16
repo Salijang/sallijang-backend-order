@@ -16,6 +16,7 @@ class OrderCreate(BaseModel):
     store_name: str
     payment_method: str   # "toss" | "onsite"
     total_price: float
+    pickup_expected_at: Optional[str] = None  # 구매자 픽업 예정 시간 "HH:MM"
     items: List[OrderItemCreate]
 
 
@@ -41,6 +42,7 @@ class OrderResponse(BaseModel):
     status: str
     payment_method: str
     total_price: float
+    pickup_expected_at: Optional[str] = None
     created_at: datetime
     items: List[OrderItemResponse] = []
     model_config = ConfigDict(from_attributes=True)

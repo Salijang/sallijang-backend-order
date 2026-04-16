@@ -43,6 +43,7 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
         status="pending",
         payment_method=order_data.payment_method,
         total_price=order_data.total_price,
+        pickup_expected_at=order_data.pickup_expected_at,
     )
     db.add(new_order)
     await db.flush()  # ID를 얻기 위해 flush (commit 전)

@@ -1,7 +1,13 @@
 from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime
 from sqlalchemy.orm import relationship
 from database import Base
-import datetime
+from datetime import datetime, timezone, timedelta
+
+KST = timezone(timedelta(hours=9))
+
+def kst_now() -> datetime:
+    """현재 한국 표준시(KST, UTC+9)를 반환합니다."""
+    return datetime.now(KST).replace(tzinfo=None)
 
 
 class Order(Base):
@@ -17,7 +23,8 @@ class Order(Base):
     status = Column(String, default="pending", nullable=False)  # pending | completed | cancelled
     payment_method = Column(String, nullable=False)              # toss | onsite
     total_price = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    pickup_expected_at = Column(String, nullable=True)  # 구매자 픽업 예정 시간 "HH:MM" 형식
+    created_at = Column(DateTime, default=kst_now)
 
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
 
