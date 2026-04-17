@@ -4,6 +4,7 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from typing import List, Optional
 import datetime
+import os
 import httpx
 
 from database import get_db
@@ -12,20 +13,42 @@ import schemas
 
 router = APIRouter(prefix="/api/v1/orders", tags=["Orders"])
 
-PRODUCT_SERVICE_URL = "http://localhost:8001"
+PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8001")
 
 
-async def adjust_product_remaining(product_id: int, delta: int):
-    """Product Service에 재고 수량 조정을 요청합니다. delta<0=감소, delta>0=복원."""
+async def get_product_remaining(product_id: int) -> int | None:
+    """Product Service에서 현재 재고를 조회합니다. 실패 시 None 반환."""
     try:
         async with httpx.AsyncClient() as client:
-            await client.patch(
+            resp = await client.get(
+                f"{PRODUCT_SERVICE_URL}/api/v1/products/{product_id}",
+                timeout=5.0,
+            )
+        if resp.status_code == 200:
+            return resp.json().get("remaining")
+        return None
+    except Exception:
+        return None
+
+
+async def adjust_product_remaining(product_id: int, delta: int) -> tuple[bool, str]:
+    """Product Service에 재고 수량 조정을 요청합니다. delta<0=감소, delta>0=복원.
+    반환값: (성공 여부, 에러 메시지)"""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
                 f"{PRODUCT_SERVICE_URL}/api/v1/products/{product_id}/remaining",
                 params={"delta": delta},
                 timeout=5.0
             )
+        if resp.status_code == 409:
+            detail = resp.json().get("detail", "재고가 부족합니다.")
+            return False, detail
+        resp.raise_for_status()
+        return True, ""
     except Exception as e:
         print(f"[WARNING] 재고 수량 조정 실패 (product_id={product_id}, delta={delta}): {e}")
+        return False, "재고 서비스 연결에 실패했습니다."
 
 
 def generate_order_number(order_id: int, created_at: datetime.datetime) -> str:
@@ -35,6 +58,21 @@ def generate_order_number(order_id: int, created_at: datetime.datetime) -> str:
 
 @router.post("/", response_model=schemas.OrderResponse, status_code=status.HTTP_201_CREATED)
 async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depends(get_db)):
+    # pre-flight: 재고 사전 확인 (주문 생성 전에 빠르게 거부)
+    for item_data in order_data.items:
+        if item_data.product_id:
+            remaining = await get_product_remaining(item_data.product_id)
+            if remaining is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="재고 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.",
+                )
+            if remaining < item_data.quantity:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"재고가 부족합니다. 현재 남은 수량: {remaining}개",
+                )
+
     new_order = models.Order(
         order_number="TEMP",
         buyer_id=order_data.buyer_id,
@@ -48,7 +86,6 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
     db.add(new_order)
     await db.flush()  # ID를 얻기 위해 flush (commit 전)
 
-    # ID 확보 후 order_number 생성
     new_order.order_number = generate_order_number(new_order.id, new_order.created_at)
 
     for item_data in order_data.items:
@@ -61,22 +98,27 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
         )
         db.add(item)
 
+    # commit 전에 재고 차감 시도 — 재고 부족 시 DB 롤백 후 에러 반환
+    deducted = []
+    for item_data in order_data.items:
+        if item_data.product_id:
+            success, message = await adjust_product_remaining(item_data.product_id, -item_data.quantity)
+            if not success:
+                # 이미 차감한 항목 복원
+                for restored_id, restored_qty in deducted:
+                    await adjust_product_remaining(restored_id, restored_qty)
+                await db.rollback()
+                raise HTTPException(status_code=409, detail=message)
+            deducted.append((item_data.product_id, item_data.quantity))
+
     await db.commit()
 
-    # items 포함해서 재조회
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
         .filter(models.Order.id == new_order.id)
     )
-    created_order = result.scalars().first()
-
-    # 주문 확정 후 Product Service에 재고 감소 요청
-    for item_data in order_data.items:
-        if item_data.product_id:
-            await adjust_product_remaining(item_data.product_id, -item_data.quantity)
-
-    return created_order
+    return result.scalars().first()
 
 
 @router.get("/", response_model=List[schemas.OrderResponse])
@@ -146,7 +188,6 @@ async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
     order.status = "cancelled"
     await db.commit()
 
-    # 취소된 주문의 재고를 Product Service에 복원 요청
     for item in items_snapshot:
         if item.product_id:
             await adjust_product_remaining(item.product_id, item.quantity)
