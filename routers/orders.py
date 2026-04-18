@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -14,6 +14,7 @@ import schemas
 router = APIRouter(prefix="/api/v1/orders", tags=["Orders"])
 
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8001")
+NOTIFY_SERVICE_URL = os.getenv("NOTIFY_SERVICE_URL", "http://localhost:8003")
 
 
 async def get_product_remaining(product_id: int) -> int | None:
@@ -29,6 +30,29 @@ async def get_product_remaining(product_id: int) -> int | None:
         return None
     except Exception:
         return None
+
+
+async def send_notify_event(event_type: str, order: models.Order) -> None:
+    """Notify Service에 주문 이벤트를 전송합니다. 실패해도 주문 흐름에 영향 없음."""
+    try:
+        payload = {
+            "event_type": event_type,
+            "order_id": order.id,
+            "order_number": order.order_number,
+            "buyer_id": order.buyer_id,
+            "store_id": order.store_id or 0,
+            "store_name": order.store_name,
+            "product_names": [item.product_name for item in order.items],
+            "pickup_expected_at": order.pickup_expected_at,
+        }
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{NOTIFY_SERVICE_URL}/api/v1/notifications/internal/order-event",
+                json=payload,
+                timeout=3.0,
+            )
+    except Exception as e:
+        print(f"[WARNING] Notify Service 전송 실패 (event={event_type}, order_id={order.id}): {e}")
 
 
 async def adjust_product_remaining(product_id: int, delta: int) -> tuple[bool, str]:
@@ -118,7 +142,9 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
         .options(selectinload(models.Order.items))
         .filter(models.Order.id == new_order.id)
     )
-    return result.scalars().first()
+    created_order = result.scalars().first()
+    await send_notify_event("order_confirmed", created_order)
+    return created_order
 
 
 @router.get("/", response_model=List[schemas.OrderResponse])
@@ -169,12 +195,28 @@ async def update_order_status(
         raise HTTPException(status_code=404, detail="Order not found")
     order.status = status_update.status
     await db.commit()
-    await db.refresh(order)
+
+    refreshed = await db.execute(
+        select(models.Order)
+        .options(selectinload(models.Order.items))
+        .filter(models.Order.id == order_id)
+    )
+    order = refreshed.scalars().first()
+
+    if status_update.status == "completed":
+        await send_notify_event("pickup_completed", order)
+    elif status_update.status == "cancelled":
+        await send_notify_event("order_cancelled", order)
+
     return order
 
 
 @router.delete("/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
+async def cancel_order(
+    order_id: int,
+    cancelled_by: str = Query(default="buyer", description="취소 주체: buyer | seller"),
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
@@ -184,7 +226,7 @@ async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    items_snapshot = list(order.items)  # commit 전에 미리 복사
+    items_snapshot = list(order.items)
     order.status = "cancelled"
     await db.commit()
 
@@ -192,4 +234,6 @@ async def cancel_order(order_id: int, db: AsyncSession = Depends(get_db)):
         if item.product_id:
             await adjust_product_remaining(item.product_id, item.quantity)
 
+    event_type = "order_cancelled_by_buyer" if cancelled_by == "buyer" else "order_cancelled_by_seller"
+    await send_notify_event(event_type, order)
     return None
