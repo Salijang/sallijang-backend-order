@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy import func, cast
+from sqlalchemy.types import Date as SQLDate
 from typing import List, Optional
 import datetime
 import os
@@ -168,6 +170,38 @@ async def list_orders(
     query = query.order_by(models.Order.created_at.desc())
     result = await db.execute(query)
     return result.scalars().all()
+
+
+@router.get("/stats")
+async def get_order_stats(store_id: int, db: AsyncSession = Depends(get_db)):
+    """가게의 오늘/어제 완료 주문 기준 판매금액과 판매건수를 반환합니다."""
+    KST = datetime.timezone(datetime.timedelta(hours=9))
+    today = datetime.datetime.now(KST).date()
+    yesterday = today - datetime.timedelta(days=1)
+
+    async def daily_stats(date: datetime.date):
+        result = await db.execute(
+            select(
+                func.coalesce(func.sum(models.Order.total_price), 0),
+                func.count(models.Order.id),
+            ).filter(
+                models.Order.store_id == store_id,
+                models.Order.status == "completed",
+                cast(models.Order.created_at, SQLDate) == date,
+            )
+        )
+        row = result.first()
+        return int(row[0]), row[1]
+
+    today_revenue, today_count = await daily_stats(today)
+    yesterday_revenue, yesterday_count = await daily_stats(yesterday)
+
+    return {
+        "today_revenue": today_revenue,
+        "today_count": today_count,
+        "yesterday_revenue": yesterday_revenue,
+        "yesterday_count": yesterday_count,
+    }
 
 
 @router.get("/{order_id}", response_model=schemas.OrderResponse)
