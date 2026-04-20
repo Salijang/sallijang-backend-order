@@ -1,15 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import contextlib
-from database import engine, Base
+from database import engine
 from routers import orders
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 개발 편의를 위한 자동 테이블 생성
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
     yield
     await engine.dispose()
 
