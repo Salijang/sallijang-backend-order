@@ -76,12 +76,15 @@ async def adjust_product_remaining(product_id: int, delta: int) -> tuple[bool, s
 
 
 def generate_order_number(order_id: int, created_at: datetime.datetime) -> str:
+    """주문 ID와 생성 날짜를 조합해 'PK-YYYYMMDD-XXXX' 형식의 주문번호를 생성합니다."""
     date_str = created_at.strftime("%Y%m%d")
     return f"PK-{date_str}-{order_id:04d}"
 
 
 @router.post("/", response_model=schemas.OrderResponse, status_code=status.HTTP_201_CREATED)
 async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depends(get_db)):
+    """주문을 생성합니다. 재고 사전 확인 → 주문 생성 → 재고 차감 → 알림 전송 순서로 처리됩니다.
+    재고 차감 실패 시 이미 차감된 항목을 롤백하고 DB 트랜잭션도 취소합니다."""
     # pre-flight: 재고 사전 확인 (주문 생성 전에 빠르게 거부)
     for item_data in order_data.items:
         if item_data.product_id:
@@ -154,6 +157,7 @@ async def list_orders(
     status: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
+    """주문 목록을 조회합니다. buyer_id, store_id, status로 필터링하며 최신순으로 반환합니다."""
     query = select(models.Order).options(selectinload(models.Order.items))
     if buyer_id is not None:
         query = query.filter(models.Order.buyer_id == buyer_id)
@@ -168,6 +172,7 @@ async def list_orders(
 
 @router.get("/{order_id}", response_model=schemas.OrderResponse)
 async def get_order(order_id: int, db: AsyncSession = Depends(get_db)):
+    """order_id로 단일 주문을 조회합니다."""
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
@@ -185,6 +190,7 @@ async def update_order_status(
     status_update: schemas.OrderStatusUpdate,
     db: AsyncSession = Depends(get_db)
 ):
+    """주문 상태를 변경합니다. completed/cancelled 전환 시 Notify Service에 이벤트를 전송합니다."""
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
@@ -217,6 +223,7 @@ async def cancel_order(
     cancelled_by: str = Query(default="buyer", description="취소 주체: buyer | seller"),
     db: AsyncSession = Depends(get_db),
 ):
+    """주문을 취소합니다. 차감된 상품 재고를 복원하고 취소 주체에 따른 알림을 전송합니다."""
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
