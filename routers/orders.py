@@ -10,6 +10,7 @@ import os
 import httpx
 
 from database import get_db
+from deps import get_current_user, CurrentUser
 import models
 import schemas
 
@@ -20,7 +21,6 @@ NOTIFY_SERVICE_URL = os.getenv("NOTIFY_SERVICE_URL", "http://localhost:8003")
 
 
 async def get_product_remaining(product_id: int) -> int | None:
-    """Product Service에서 현재 재고를 조회합니다. 실패 시 None 반환."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -35,7 +35,6 @@ async def get_product_remaining(product_id: int) -> int | None:
 
 
 async def send_notify_event(event_type: str, order: models.Order) -> None:
-    """Notify Service에 주문 이벤트를 전송합니다. 실패해도 주문 흐름에 영향 없음."""
     try:
         payload = {
             "event_type": event_type,
@@ -58,8 +57,6 @@ async def send_notify_event(event_type: str, order: models.Order) -> None:
 
 
 async def adjust_product_remaining(product_id: int, delta: int) -> tuple[bool, str]:
-    """Product Service에 재고 수량 조정을 요청합니다. delta<0=감소, delta>0=복원.
-    반환값: (성공 여부, 에러 메시지)"""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.patch(
@@ -78,33 +75,27 @@ async def adjust_product_remaining(product_id: int, delta: int) -> tuple[bool, s
 
 
 def generate_order_number(order_id: int, created_at: datetime.datetime) -> str:
-    """주문 ID와 생성 날짜를 조합해 'PK-YYYYMMDD-XXXX' 형식의 주문번호를 생성합니다."""
     date_str = created_at.strftime("%Y%m%d")
     return f"PK-{date_str}-{order_id:04d}"
 
 
 @router.post("/", response_model=schemas.OrderResponse, status_code=status.HTTP_201_CREATED)
-async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depends(get_db)):
-    """주문을 생성합니다. 재고 사전 확인 → 주문 생성 → 재고 차감 → 알림 전송 순서로 처리됩니다.
-    재고 차감 실패 시 이미 차감된 항목을 롤백하고 DB 트랜잭션도 취소합니다."""
-    # pre-flight: 재고 사전 확인 (주문 생성 전에 빠르게 거부)
+async def create_order(
+    order_data: schemas.OrderCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     for item_data in order_data.items:
         if item_data.product_id:
             remaining = await get_product_remaining(item_data.product_id)
             if remaining is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail="재고 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.",
-                )
+                raise HTTPException(status_code=503, detail="재고 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
             if remaining < item_data.quantity:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"재고가 부족합니다. 현재 남은 수량: {remaining}개",
-                )
+                raise HTTPException(status_code=409, detail=f"재고가 부족합니다. 현재 남은 수량: {remaining}개")
 
     new_order = models.Order(
         order_number="TEMP",
-        buyer_id=order_data.buyer_id,
+        buyer_id=current_user.user_id,
         store_id=order_data.store_id,
         store_name=order_data.store_name,
         status="pending",
@@ -113,7 +104,7 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
         pickup_expected_at=order_data.pickup_expected_at,
     )
     db.add(new_order)
-    await db.flush()  # ID를 얻기 위해 flush (commit 전)
+    await db.flush()
 
     new_order.order_number = generate_order_number(new_order.id, new_order.created_at)
 
@@ -127,13 +118,11 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
         )
         db.add(item)
 
-    # commit 전에 재고 차감 시도 — 재고 부족 시 DB 롤백 후 에러 반환
     deducted = []
     for item_data in order_data.items:
         if item_data.product_id:
             success, message = await adjust_product_remaining(item_data.product_id, -item_data.quantity)
             if not success:
-                # 이미 차감한 항목 복원
                 for restored_id, restored_qty in deducted:
                     await adjust_product_remaining(restored_id, restored_qty)
                 await db.rollback()
@@ -154,17 +143,16 @@ async def create_order(order_data: schemas.OrderCreate, db: AsyncSession = Depen
 
 @router.get("/", response_model=List[schemas.OrderResponse])
 async def list_orders(
-    buyer_id: Optional[int] = None,
     store_id: Optional[int] = None,
     status: Optional[str] = None,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    """주문 목록을 조회합니다. buyer_id, store_id, status로 필터링하며 최신순으로 반환합니다."""
     query = select(models.Order).options(selectinload(models.Order.items))
-    if buyer_id is not None:
-        query = query.filter(models.Order.buyer_id == buyer_id)
     if store_id is not None:
         query = query.filter(models.Order.store_id == store_id)
+    else:
+        query = query.filter(models.Order.buyer_id == current_user.user_id)
     if status is not None:
         query = query.filter(models.Order.status == status)
     query = query.order_by(models.Order.created_at.desc())
@@ -173,8 +161,11 @@ async def list_orders(
 
 
 @router.get("/stats")
-async def get_order_stats(store_id: int, db: AsyncSession = Depends(get_db)):
-    """가게의 오늘/어제 완료 주문 기준 판매금액과 판매건수를 반환합니다."""
+async def get_order_stats(
+    store_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     KST = datetime.timezone(datetime.timedelta(hours=9))
     today = datetime.datetime.now(KST).date()
     yesterday = today - datetime.timedelta(days=1)
@@ -205,8 +196,11 @@ async def get_order_stats(store_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{order_id}", response_model=schemas.OrderResponse)
-async def get_order(order_id: int, db: AsyncSession = Depends(get_db)):
-    """order_id로 단일 주문을 조회합니다."""
+async def get_order(
+    order_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
@@ -222,9 +216,9 @@ async def get_order(order_id: int, db: AsyncSession = Depends(get_db)):
 async def update_order_status(
     order_id: int,
     status_update: schemas.OrderStatusUpdate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    """주문 상태를 변경합니다. completed/cancelled 전환 시 Notify Service에 이벤트를 전송합니다."""
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
@@ -256,8 +250,8 @@ async def cancel_order(
     order_id: int,
     cancelled_by: str = Query(default="buyer", description="취소 주체: buyer | seller"),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    """주문을 취소합니다. 차감된 상품 재고를 복원하고 취소 주체에 따른 알림을 전송합니다."""
     result = await db.execute(
         select(models.Order)
         .options(selectinload(models.Order.items))
