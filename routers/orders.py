@@ -11,13 +11,14 @@ import httpx
 
 from database import get_db
 from deps import get_current_user, CurrentUser
+from redis_client import reserve_stock, restore_stock
+from sqs_client import publish_order_event
 import models
 import schemas
 
 router = APIRouter(prefix="/api/v1/orders", tags=["Orders"])
 
 PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8001")
-NOTIFY_SERVICE_URL = os.getenv("NOTIFY_SERVICE_URL", "http://localhost:8003")
 
 
 async def get_product_remaining(product_id: int) -> int | None:
@@ -35,25 +36,17 @@ async def get_product_remaining(product_id: int) -> int | None:
 
 
 async def send_notify_event(event_type: str, order: models.Order) -> None:
-    try:
-        payload = {
-            "event_type": event_type,
-            "order_id": order.id,
-            "order_number": order.order_number,
-            "buyer_id": order.buyer_id,
-            "store_id": order.store_id or 0,
-            "store_name": order.store_name,
-            "product_names": [item.product_name for item in order.items],
-            "pickup_expected_at": order.pickup_expected_at,
-        }
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{NOTIFY_SERVICE_URL}/api/v1/notifications/internal/order-event",
-                json=payload,
-                timeout=3.0,
-            )
-    except Exception as e:
-        print(f"[WARNING] Notify Service 전송 실패 (event={event_type}, order_id={order.id}): {e}")
+    payload = {
+        "event_type": event_type,
+        "order_id": order.id,
+        "order_number": order.order_number,
+        "buyer_id": order.buyer_id,
+        "store_id": order.store_id or 0,
+        "store_name": order.store_name,
+        "product_names": [item.product_name for item in order.items],
+        "pickup_expected_at": order.pickup_expected_at,
+    }
+    await publish_order_event(payload)
 
 
 async def adjust_product_remaining(product_id: int, delta: int) -> tuple[bool, str]:
@@ -85,8 +78,20 @@ async def create_order(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    # Redis로 재고를 원자적으로 선점. 장애 시 HTTP 폴백.
+    redis_reserved: list[tuple[int, int]] = []
     for item_data in order_data.items:
-        if item_data.product_id:
+        if not item_data.product_id:
+            continue
+        result = await reserve_stock(item_data.product_id, item_data.quantity)
+        if result is False:
+            for pid, qty in redis_reserved:
+                await restore_stock(pid, qty)
+            raise HTTPException(status_code=409, detail="재고가 부족합니다.")
+        if result is True:
+            redis_reserved.append((item_data.product_id, item_data.quantity))
+        # result is None → Redis 장애: HTTP 폴백으로 처리
+        if result is None:
             remaining = await get_product_remaining(item_data.product_id)
             if remaining is None:
                 raise HTTPException(status_code=503, detail="재고 정보를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
@@ -267,6 +272,7 @@ async def cancel_order(
 
     for item in items_snapshot:
         if item.product_id:
+            await restore_stock(item.product_id, item.quantity)
             await adjust_product_remaining(item.product_id, item.quantity)
 
     event_type = "order_cancelled_by_buyer" if cancelled_by == "buyer" else "order_cancelled_by_seller"
