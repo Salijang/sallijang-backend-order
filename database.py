@@ -33,7 +33,7 @@ engine = create_async_engine(
     _url,
     pool_recycle=600,
     connect_args=_connect_args,
-    echo=True,
+    echo=False,
 )
 
 if _USE_IAM:
