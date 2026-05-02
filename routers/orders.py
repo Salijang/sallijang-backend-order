@@ -130,6 +130,8 @@ async def create_order(
             if not success:
                 for restored_id, restored_qty in deducted:
                     await adjust_product_remaining(restored_id, restored_qty)
+                for pid, qty in redis_reserved:
+                    await restore_stock(pid, qty)
                 await db.rollback()
                 raise HTTPException(status_code=409, detail=message)
             deducted.append((item_data.product_id, item_data.quantity))
@@ -200,6 +202,17 @@ async def get_order_stats(
     }
 
 
+@router.get("/internal/pending", include_in_schema=False)
+async def list_pending_orders_internal(db: AsyncSession = Depends(get_db)):
+    """내부 서비스 전용 — 인증 없이 pending 주문 목록 반환."""
+    result = await db.execute(
+        select(models.Order)
+        .options(selectinload(models.Order.items))
+        .filter(models.Order.status == "pending")
+    )
+    return result.scalars().all()
+
+
 @router.get("/{order_id}", response_model=schemas.OrderResponse)
 async def get_order(
     order_id: int,
@@ -245,6 +258,10 @@ async def update_order_status(
     if status_update.status == "completed":
         await send_notify_event("pickup_completed", order)
     elif status_update.status == "cancelled":
+        for item in order.items:
+            if item.product_id:
+                await restore_stock(item.product_id, item.quantity)
+                await adjust_product_remaining(item.product_id, item.quantity)
         await send_notify_event("order_cancelled", order)
 
     return order
