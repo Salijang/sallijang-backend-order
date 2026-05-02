@@ -11,7 +11,6 @@ class OrderItemCreate(BaseModel):
 
 
 class OrderCreate(BaseModel):
-    buyer_id: int
     store_id: Optional[int] = None
     store_name: str
     payment_method: str   # "toss" | "onsite"
